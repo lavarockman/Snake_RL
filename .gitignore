@@ -1,0 +1,5 @@
+models/**
+__pycache__/**
+.vscode/**
+saves/**
+debug.log
