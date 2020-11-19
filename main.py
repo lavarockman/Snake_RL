@@ -13,6 +13,7 @@ import shutil
 import tempfile
 import io
 import math
+import configparser
 
 from tf_agents.environments import py_environment
 from tf_agents.environments import tf_environment
@@ -43,23 +44,27 @@ from death_watcher import Death_Watcher
 from snake_env import SnakeEnv
 
 tf.compat.v1.enable_v2_behavior()
+config = configparser.ConfigParser()
+model_config = config['Model']
+training_config = config['Training']
 
-relative_path = "models/ep_greedy"
-# relative_path = "models/normal"
-savedir = os.path.join(os.getcwd(), relative_path)
-checkpoint_zip_filename = r"C:\Users\Levi\Programming\Python\Deep_Learning\Snake\models\ep_greedy\exported_cp.zip"
+model_name = model_config['model_name']
+batch_size = model_config['batch_size']
+collect_steps_per_iteration = model_config['collect_steps_per_iteration']
+replay_buffer_max_length = model_config['replay_buffer_max_length']
+log_interval = model_config['log_interval']
+num_eval_episodes = model_config['num_eval_episodes']
+eval_interval = model_config['eval_interval']
 
-collect_steps_per_iteration = 100
-replay_buffer_max_length = 1000
+num_iteraions = training_config['num_iteraions']
+num_checkpoints = training_config['num_checkpoints']
+learning_rate = training_config['learning_rate']
+epsilon_start = training_config['epsilon_starting_num']
+epsilon_decay = training_config['epslion_decay_rate']
 
+epsilon = epsilon_start
 fc_layer_params = (100,)
-
-batch_size = 32
-learning_rate = 1e-3
-log_interval = 5
-
-num_eval_episodes = 10
-eval_interval = 25
+savedir = os.path.join(os.getcwd(), 'models', model_name)
 
 
 def set_up_env(io):
@@ -78,55 +83,45 @@ def set_up_agent(env, q_net, global_step):
         q_network=q_net,
         optimizer=optimizer,
         td_errors_loss_fn=common.element_wise_squared_loss,
-        train_step_counter=global_step)
+        train_step_counter=global_step,
+        debug_summaries=True)
     agent.initialize()
     return agent
 
 
-def compute_avg_return(environment, policy, num_episodes=10):
+def set_up_saver(agent, replay_buffer):
+    checkpoint_dir = os.path.join(savedir, 'checkpoint')
+    train_checkpointer = common.Checkpointer(
+        ckpt_dir=checkpoint_dir,
+        max_to_keep=1,
+        agent=agent,
+        policy=agent.policy,
+        replay_buffer=replay_buffer,
+        global_step=global_step
+    )
 
-    total_return = 0.0
-    for _ in range(num_episodes):
-
-        time_step = environment.reset()
-        episode_return = 0.0
-
-        while not time_step.is_last():
-            action_step = policy.action(time_step)
-            time_step = environment.step(action_step.action)
-            episode_return += time_step.reward
-        total_return += episode_return
-
-    avg_return = total_return / num_episodes
-    return avg_return.numpy()[0]
+    policy_dir = os.path.join(savedir, 'policy')
+    tf_policy_saver = policy_saver.PolicySaver(agent.policy)
+    return train_checkpointer, tf_policy_saver, checkpoint_dir, policy_dir
 
 
-def collect_step(environment, policy, buffer):
-    time_step = environment.current_time_step()
-    action_step = policy.action(time_step)
-    next_time_step = environment.step(action_step.action)
-    traj = trajectory.from_transition(time_step, action_step, next_time_step)
+def get_policy(env, q_net, epsilon_callback):
 
-    # Add trajectory to the replay buffer
-    buffer.add_batch(traj)
-
-
-def collect_data(env, policy, buffer, steps):
-    for _ in range(steps):
-        collect_step(env, policy, buffer)
+    q_plcy = q_policy.QPolicy(env.time_step_spec(),
+                              env.action_spec(),
+                              q_network=q_net)
+    # greedy_plcy = greedy_policy.GreedyPolicy(q_plcy)
+    ep_greedy_plcy = epsilon_greedy_policy.EpsilonGreedyPolicy(
+        q_plcy, epsilon_callback)
+    plcy = ep_greedy_plcy
+    return plcy
 
 
 def data_collection(agnt, env, policy):
-    # replay_buffer = tf_uniform_replay_buffer.TFUniformReplayBuffer(
-    #     data_spec=agnt.collect_data_spec,
-    #     batch_size=env.batch_size,
-    #     max_length=replay_buffer_capacity)
-
     replay_buffer = tf_uniform_replay_buffer.TFUniformReplayBuffer(
-        data_spec=agent.collect_data_spec,
-        batch_size=train_env.batch_size,
+        data_spec=agnt.collect_data_spec,
+        batch_size=env.batch_size,
         max_length=replay_buffer_max_length)
-
     collect_driver = dynamic_step_driver.DynamicStepDriver(
         env,
         policy,
@@ -159,96 +154,16 @@ def train_one_iteration(agent, iterator, driver):
     print('iteration: {0} loss: {1}'.format(iteration, train_loss.loss))
 
 
-game_io = IO()
-game_io.initialize()
-
-train_env, eval_env = set_up_env(game_io)
-global_step = tf.compat.v1.train.get_or_create_global_step()
-
-q_net = q_network.QNetwork(
-    train_env.observation_spec(),
-    train_env.action_spec(),
-    fc_layer_params=fc_layer_params)
-agent = set_up_agent(train_env, q_net, global_step)
-
-q_plcy = q_policy.QPolicy(train_env.time_step_spec(),
-                          train_env.action_spec(),
-                          q_network=q_net)
-
-greedy_plcy = greedy_policy.GreedyPolicy(q_plcy)
-ep_greedy_plcy = epsilon_greedy_policy.EpsilonGreedyPolicy(q_plcy, 1.0)
-plcy = ep_greedy_plcy
-
-# print("overriding greedy policy")
-# greedy_plcy = agent.collect_policy
-
-replay_buffer = tf_uniform_replay_buffer.TFUniformReplayBuffer(
-    data_spec=agent.collect_data_spec,
-    batch_size=train_env.batch_size,
-    max_length=replay_buffer_max_length)
-
-dataset = replay_buffer.as_dataset(
-    num_parallel_calls=3,
-    sample_batch_size=batch_size,
-    num_steps=2).prefetch(3)
-
-iterator = iter(dataset)
-
-agent.train = common.function(agent.train)
-
-# Reset the train step
-agent.train_step_counter.assign(0)
-
-# Evaluate the agent's policy once before training.
-# avg_return = compute_avg_return(eval_env, agent.policy, num_eval_episodes)
-# returns = [avg_return]
-returns = []
-
-checkpoint_dir = os.path.join(savedir, 'checkpoint')
-train_checkpointer = common.Checkpointer(
-    ckpt_dir=checkpoint_dir,
-    max_to_keep=1,
-    agent=agent,
-    policy=agent.policy,
-    replay_buffer=replay_buffer,
-    global_step=global_step
-)
-
-policy_dir = os.path.join(savedir, 'policy')
-tf_policy_saver = policy_saver.PolicySaver(agent.policy)
-
-def do_iterations(num, returns):
-    for _ in range(num):
-        # Collect a few steps using collect_policy and save to the replay buffer.
-        collect_data(train_env, plcy, replay_buffer, collect_steps_per_iteration)
-
-        # Sample a batch of data from the buffer and update the agent's network.
-        experience, unused_info = next(iterator)
-        train_loss = agent.train(experience).loss
-
-        step = agent.train_step_counter.numpy()
-
-        if step % log_interval == 0:
-            print('step = {0}: loss = {1}'.format(step, train_loss))
-
-        if step % eval_interval == 0:
-            print('evaluating')
-            avg_return = compute_avg_return(eval_env, agent.policy, num_eval_episodes)
-            print('step = {0}: Average Return = {1}'.format(step, avg_return))
-            returns.append(avg_return)
+def do_iterations(num, total, current):
+    for i in range(num):
+        train_one_iteration(agent, iterator, collect_driver)
+        print('{}/{} iterations completed'.format(current+i+1, total))
 
 
-def save_checkpoint():
-    print("saving checkpoint")
-    train_checkpointer.save(global_step)
-    checkpoint_zip_filename = create_zip_file(
-        checkpoint_dir, os.path.join(savedir, 'exported_cp'))
-    print("saved!")
-    return checkpoint_zip_filename
-
-def do_checkpoints(total, checkpoints, returns):
+def do_checkpoints(total, checkpoints, saver):
     reps = math.floor(total / checkpoints)
     count = 0
+    print('running {} iterations with {} checkpoints...'.format(total, checkpoints))
     for _ in range(checkpoints + 1):
         if count >= total:
             break
@@ -256,13 +171,10 @@ def do_checkpoints(total, checkpoints, returns):
         if iterations + count > total:
             iterations = total - count
         print("doing {} iterations".format(iterations))
-        do_iterations(iterations, returns)
+        do_iterations(iterations, total, count)
         count += iterations
         print("{}/{} iterations completed".format(count, total))
-        # print("completed iterations, saving checkpoint")
-        save_checkpoint()
-        
-
+        saver.save()
 
 
 def run_episodes(policy, eval_tf_env, num_episodes=3):
@@ -272,49 +184,49 @@ def run_episodes(policy, eval_tf_env, num_episodes=3):
             action_step = policy.action(time_step)
             time_step = eval_tf_env.step(action_step.action)
 
+def epsilon_decrease():
+    epsilon *= epsilon_decay
+    return epsilon
 
-def create_zip_file(dirname, base_filename):
-    return shutil.make_archive(base_filename, 'zip', dirname)
+game_io = IO()
+print('initializing game io')
+game_io.initialize()
 
+print('setting up environment')
+train_env, eval_env = set_up_env(game_io)
+global_step = tf.compat.v1.train.get_or_create_global_step()
 
-def unzip_file_to(filepath, dirname):
-    with zipfile.ZipFile(filepath, 'r') as zip_ref:
-        zip_ref.extractall(dirname)
+print('creating q net')
+q_net = q_network.QNetwork(
+    train_env.observation_spec(),
+    train_env.action_spec(),
+    fc_layer_params=fc_layer_params)
 
+print('setting up agent')
+agent = set_up_agent(train_env, q_net, global_step)
+print('getting policy')
+policy = get_policy(train_env, q_net, epsilon_decrease)
+agent.train = common.function(agent.train)
 
-checkpoint_zip_filename = save_checkpoint()
+print('initial data collection')
+iterator, collect_driver, replay_buffer = data_collection(
+    agent, train_env, policy)
 
-print("loading checkpoint")
-unzip_file_to(checkpoint_zip_filename, checkpoint_dir)
-train_checkpointer.initialize_or_restore()
+print('setting up checkpoint and policy saver')
+checkpoint_saver, tf_policy_saver, checkpoint_dir, policy_dir = set_up_saver(
+    agent, replay_buffer)
+
+print("initializing or restoring checkpoint")
+checkpoint_saver.initialize_or_restore()
 global_step = tf.compat.v1.train.get_global_step()
 
-
-do_checkpoints(200, 10, returns)
-
-# def run_iterations_with_checkpoints(reps, sets):
-#     total = 1
-#     for i in range(sets):
-#         print("set {}/{}".format(i+1, sets))
-#         print("training reps")
-#         do_iterations(reps, sets, total)
-#         total += reps
-
-#         print("saving checkpoint")
-#         train_checkpointer.save(global_step)
-#         create_zip_file(checkpoint_dir, os.path.join(savedir, 'exported_cp'))
-#         print("saved!")
-
-
-# run_iterations_with_checkpoints(15, 2)
+print('running iterations')
+do_checkpoints(num_iteraions, num_checkpoints, checkpoint_saver)
 
 print("saving policy")
 tf_policy_saver.save(policy_dir)
-policy_zip_filename = create_zip_file(
-    policy_dir, os.path.join(savedir, 'exported_policy'))
 
 print("loading policy")
-unzip_file_to(policy_zip_filename, policy_dir)
 saved_policy = tf.compat.v2.saved_model.load(policy_dir)
 
 print("testing policy")
